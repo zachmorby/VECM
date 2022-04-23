@@ -1,0 +1,148 @@
+---
+title: "Var/VECM"
+author: "Zach Morby"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output: 
+  html_document:
+    df_print: paged
+    code_folding: "hide"
+    toc: true
+    fig_caption: yes
+    theme: cerulean
+    toc_float: no
+---
+
+Link to GitHub: [zachmorby.github.io](https://zachmorby.github.io/)
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+graphics.off()
+```
+
+```{r load packages, message = FALSE, include = FALSE}
+require(fpp3)
+require(tidyverse)
+require(dplyr)
+require(tidyquant)
+require(lubridate)
+require(timetk)
+require(vars)
+require(lmtest)
+require(kableExtra)
+require(aTSA)
+require(stargazer)
+require(urca)
+require(tsDyn)
+require(apt) 
+```
+
+# Introduction
+This paper will be exploring the relationship between Personal Savings (PMSAVE) and Disposable Personal Income (DSPI). Both of these variables are recorded in units of Billions of Dollars, seasonally adjusted annual rate. We will attempt to discover which, if either, of these variables leads the other. Knowing this would allow someone to predict how the other would react to a shock in the leading variable.
+
+We downloaded the variables directly from the FRED website with data from 1960 until the present.
+
+```{r getdata}
+VarList <- c("DSPI", "PMSAVE")
+X <- tq_get(VarList, get = "economic.data", from = "1960-01-01") %>%
+  mutate(Month = yearmonth(date)) %>% dplyr::select(-date) %>%
+  as_tsibble(index = Month, key = symbol)
+Xw <- X %>%
+  pivot_wider(names_from = symbol, values_from = price) %>%
+  as_tsibble()
+```
+
+# First Look 
+Just a quick look at the graphs of variables below show that they appear to be obviously correlated. It is not immediately evident which variable is leading or following, but it is obvious that they move together.
+
+```{r plot}
+X %>% ggplot(aes(x = Month, y = price)) +
+  geom_line() +
+  facet_grid(vars(symbol), scales = "free_y") 
+```
+
+# Checking for Stationarity
+
+We continue by running a unit root check. This allows us to see whether the variables are stationary or not. Stationary variables would allow us to run a Vector Autoregression (VAR) model. After running the check, we found that both of the variables are non-stationary. After accounting for non-stationarity, we will test for cointegration between the two variables. If they are non-stationary (they are) AND cointegrated, we will use the Vector Error Correction Model (VECM) to explore the relationship.
+
+
+```{r unit root check, results = FALSE}
+X %>% 
+  features(price, unitroot_ndiffs) %>% 
+  kable(format = "html", table.attr = "style='width:30%;' ") %>% 
+  kableExtra::kable_styling()
+```
+
+# Accounting for Non-Stationarity
+In order to analyze the variables well, we needed to difference them  to allow them to be stationary. Non-stationary variables are difficult to analyze because the model is always chasing the data and never able to actually catch it. Therefore our analysis is never accurate.
+
+```{r mutate}
+Zspending <- Xw %>%
+  mutate(gDSPI = 100 * difference(difference(log(DSPI))),
+         gPMSAVE = 100 * difference(log(PMSAVE))) %>%
+  dplyr::select(gDSPI, gPMSAVE) %>% 
+  tidyr::drop_na()
+zspending <- as.ts(Zspending, start = c(1960, 2), frequency = 12)
+```
+
+# Testing for Cointegration
+Below is the output from our cointegration test. The variable DSPI is labeled as drunk and the variable PMSAVE is labeled as puppy. This is from the classic paper describing two cointegrated variables as a drunk and a puppy. The drunk variable will move in a random way, but will not follow the puppy variable. Whereas the puppy variable will move in a random way, but will always correct back to the drunk variable. We have found evidence that DSPI is the drunk variable in this cointegrated pair. We will find further evidence of this later in the paper as well.
+
+In this cointegration test, we find that the variables are likely cointegrated. 
+
+We follow this up by testing the residuals from this equation to see if they are stationary. We find that they are stationary and these two variables are cointegrated.
+
+```{r, results = FALSE, warning = FALSE, message = FALSE, error = FALSE}
+drunk <- zspending[,1]
+puppy <- zspending[,2]
+coint.out <- lm(drunk ~ puppy)
+output <- stargazer(coint.out, type = 'html', title = "Cointegrating Relationship", align = TRUE)
+```
+
+`r output` 
+
+```{r, results = FALSE}
+coint.resids <- coint.out$residuals
+ur.resids <- ur.df(coint.resids, type = "drift", selectlags = "BIC")
+summary(ur.resids)
+```
+
+# VECM Model
+We ran a VECM model and the resulting coefficients reaffirmed what we already believed. Disposable personal income leads and Personal Savings corrects to Disposable Income. I.e. DSPI is the drunk and PMSAVE is the puppy. This makes logical sense. Both disposable income and personal savings can change from shocks to the economy, but only one of those affects the other. Savings may change when disposable income changes, but disposable income isn't affected by level of savings.
+
+```{r, results = FALSE}
+z.DrunkDog <- as.ts(cbind(drunk, puppy))
+p.vecm <- as.integer(VARselect(z.DrunkDog,lag.max=12,type="const")$selection[2]) # -1
+vecm.DrunkDog <- VECM(z.DrunkDog,p.vecm,r=1,include="const",estim="ML",LRinclude="none")
+summary(vecm.DrunkDog)
+```
+
+# Impulse Response Function
+The top graph shows what would happen to personal savings if we shock disposable income. Personal savings drastically corrects before somewhat evening out. In the second graph, we look at what would happen to disposable income if personal savings received a shock. The graph clearly shows that disposable income is not really affected by personal savings. It stays pretty steady no matter what.
+
+```{r}
+irf.DrunkDog <- irf(vecm.DrunkDog, n.ahead = 6)
+plot(irf.DrunkDog)
+
+```
+
+# FEVD
+FEVD, or Forecast Error Variance Decomposition, shows that the variance in the path of the drunk is independent of the variation in the path of the puppy. However, the variance in the path of the Drunk plays an steady role over time-steps in the path of the puppy. This is shown by the graphs below. Although, oddly enough, the graphs also show that the puppy accounts for slightly more of the drunk's path over time.
+
+
+```{r}
+plot(fevd(vecm.DrunkDog, n.ahead = 30))
+```
+
+# Puppy's Error Correction Path
+The following graph shows the correction that the puppy makes towards the drunk over time. The puppy seems to have stayed relatively close to the drunk over time. The large corrections at the end were most likely caused by COVID data.
+
+```{r}
+cointvector <- vecm.DrunkDog$model.specific$beta
+ECT <- z.DrunkDog %*% cointvector
+plot(ECT, type = "l", ylab="ECT", xlab = "Number of steps", main = "Error correction path of the Dog", sub = "The blue horizontal line is the mean distance of the Dog from the Drunk")
+abline(h=mean(ECT),col="blue")
+```
+
+# Conclusion
+These variables, personal savings and disposable personal income, are clearly linked. It almost appears as if they are both drunks that are paired to each other. They never stray too far away from each other and correct quickly. Even the FEVD graph showing that the personal savings accounts for higher variation in disposable income over time points to this conclusion. If it weren't for the economic intuition that allows us to know that disposable income levels are more likely to affect personal savings than the other way around, we would be even more inclined to make this argument. 
